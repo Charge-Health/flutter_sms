@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.telephony.SmsManager
+import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -97,12 +98,33 @@ class FlutterSmsPlugin: FlutterPlugin, MethodCallHandler, ActivityAware, PluginR
 
   @TargetApi(Build.VERSION_CODES.ECLAIR)
   private fun canSendSMS(): Boolean {
-    if (!activity!!.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY))
-      return false
-    val intent = Intent(Intent.ACTION_SENDTO)
-    intent.data = Uri.parse("smsto:")
-    val activityInfo = intent.resolveActivityInfo(activity!!.packageManager, intent.flags.toInt())
-    return !(activityInfo == null || !activityInfo.exported)
+    return try {
+      // Check if we can create an SMS intent
+      val intent = Intent(Intent.ACTION_SENDTO)
+      intent.data = Uri.parse("smsto:")
+      val activityInfo = intent.resolveActivityInfo(activity!!.packageManager, intent.flags.toInt())
+      
+      // If we can resolve the SMS intent, we can send SMS
+      if (activityInfo != null && activityInfo.exported) {
+        return true
+      }
+      
+      // Alternative check: try to get SmsManager
+      try {
+        val smsManager = SmsManager.getDefault()
+        // If we can get SmsManager without exception, we can likely send SMS
+        return true
+      } catch (e: SecurityException) {
+        Log.w("FlutterSms", "SecurityException when checking SmsManager: ${e.message}")
+        return false
+      } catch (e: Exception) {
+        Log.w("FlutterSms", "Exception when checking SmsManager: ${e.message}")
+        return false
+      }
+    } catch (e: Exception) {
+      Log.e("FlutterSms", "Error checking SMS capability: ${e.message}")
+      false
+    }
   }
 
   private fun sendSMS(result: Result, phones: String, message: String, sendDirect: Boolean) {
@@ -115,34 +137,85 @@ class FlutterSmsPlugin: FlutterPlugin, MethodCallHandler, ActivityAware, PluginR
   }
 
   private fun sendSMSDirect(result: Result, phones: String, message: String) {
-    // SmsManager is android.telephony
-    val sentIntent = PendingIntent.getBroadcast(activity, 0, Intent("SMS_SENT_ACTION"), PendingIntent.FLAG_IMMUTABLE)
-    val mSmsManager : SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      activity!!.getSystemService(SmsManager::class.java)
-    } else {
-      SmsManager.getDefault()
+    try {
+        // Create PendingIntent with FLAG_IMMUTABLE for Android 12+ compatibility
+        val sentIntent = PendingIntent.getBroadcast(
+            activity, 
+            0, 
+            Intent("SMS_SENT_ACTION"), 
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        
+        val smsManager = SmsManager.getDefault()
+        val numbers = phones.split(";")
+        
+        for (num in numbers) {
+            val trimmedNum = num.trim()
+            if (trimmedNum.isEmpty()) continue
+            
+            Log.d("Flutter SMS", "Message length (bytes): ${message.toByteArray().size}")
+            
+            // Use more accurate SMS length calculation (160 chars for GSM 7-bit)
+            if (message.length > 160 || message.toByteArray().size > 160) {
+                val partMessages = smsManager.divideMessage(message)
+                
+                // Create sent and delivery intents for multipart messages
+                val sentIntents = arrayListOf<PendingIntent>()
+                val deliveryIntents = arrayListOf<PendingIntent>()
+                
+                repeat(partMessages.size) { index ->
+                    sentIntents.add(
+                        PendingIntent.getBroadcast(
+                            activity,
+                            index,
+                            Intent("SMS_SENT_ACTION"),
+                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                        )
+                    )
+                }
+                
+                smsManager.sendMultipartTextMessage(
+                    trimmedNum,
+                    null,
+                    partMessages,
+                    sentIntents,
+                    deliveryIntents.takeIf { it.isNotEmpty() }
+                )
+            } else {
+                smsManager.sendTextMessage(
+                    trimmedNum,
+                    null,
+                    message,
+                    sentIntent,
+                    null
+                )
+            }
+        }
+        
+        result.success("sent")
+        
+    } catch (e: SecurityException) {
+        Log.e("Flutter SMS", "Security exception: ${e.message}")
+        result.error("permission_denied", "SMS permission denied: ${e.message}", null)
+    } catch (e: IllegalArgumentException) {
+        Log.e("Flutter SMS", "Invalid argument: ${e.message}")
+        result.error("invalid_argument", "Invalid SMS parameters: ${e.message}", null)
+    } catch (e: Exception) {
+        Log.e("Flutter SMS", "SMS send failed: ${e.message}")
+        result.error("send_failed", "Failed to send SMS: ${e.message}", null)
     }
-    val numbers = phones.split(";")
-
-    for (num in numbers) {
-      Log.d("Flutter SMS", "msg.length() : " + message.toByteArray().size)
-      if (message.toByteArray().size > 80) {
-        val partMessage = mSmsManager.divideMessage(message)
-        mSmsManager.sendMultipartTextMessage(num, null, partMessage, null, null)
-      } else {
-        mSmsManager.sendTextMessage(num, null, message, sentIntent, null)
-      }
-    }
-
-    result.success("sent")
   }
 
   private fun sendSMSDialog(phones: String, message: String) {
-    val intent = Intent(Intent.ACTION_SENDTO)
-    intent.data = Uri.parse("smsto:$phones")
-    intent.putExtra("sms_body", message)
-    intent.putExtra(Intent.EXTRA_TEXT, message)
-    activity?.startActivityForResult(intent, REQUEST_CODE_SEND_SMS)
+    try {
+      val intent = Intent(Intent.ACTION_SENDTO)
+      intent.data = Uri.parse("smsto:$phones")
+      intent.putExtra("sms_body", message)
+      intent.putExtra(Intent.EXTRA_TEXT, message)
+      activity?.startActivityForResult(intent, REQUEST_CODE_SEND_SMS)
+    } catch (e: Exception) {
+      mResult?.error("intent_failed", "Failed to open SMS app: ${e.message}", null)
+    }
   }
 
   override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
@@ -150,11 +223,10 @@ class FlutterSmsPlugin: FlutterPlugin, MethodCallHandler, ActivityAware, PluginR
       if( resultCode == Activity.RESULT_OK ) {
         mResult?.success("sent")
       } else if(resultCode == Activity.RESULT_CANCELED) {
-        mResult?.success("cancelled");
+        mResult?.success("cancelled")
       } else {
-        mResult?.success("failed");
+        mResult?.success("failed")
       }
-
     }
     return false
   }
